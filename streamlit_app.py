@@ -4,10 +4,10 @@ import numpy as np
 import streamlit as st
 import yfinance as yf
 
-APP_NAME = "🚀 Expanded Universe Scanner v1.2 — MACD‑V + Weighted Scoring (Top‑5)"
+APP_NAME = "🚀 Expanded Universe Scanner v1.2.1 — MACD‑V + Weighted Scoring (Top‑5)"
 st.set_page_config(page_title=APP_NAME, layout="wide")
 st.title(APP_NAME)
-st.caption("Multi‑source universe (wild cards + indices). MACD‑V only. Weighted 0–8 score. Auto Top‑5. Full CSV available.")
+st.caption("Multi‑source universe (wild cards + indices). MACD‑V only. Weighted 0–8 score. Auto Top‑5. Robust VWAP (NaN‑safe).")
 
 # ---------------- Sidebar ----------------
 with st.sidebar:
@@ -31,7 +31,7 @@ with st.sidebar:
     days = st.slider("Lookback period (days)", 60, 365, 180)
     retries = st.slider("Max retries per ticker", 0, 5, 2)
     sleep_s = st.number_input("Sleep between downloads (sec)", min_value=0.0, value=0.12, step=0.02)
-    export_filename = st.text_input("Export base filename", "expanded_universe_v12_weighted")
+    export_filename = st.text_input("Export base filename", "expanded_universe_v121_weighted_fix")
     gate_strict = st.checkbox("Gate to high‑conviction only (WeightedScore≥5 AND MACD‑V ✅)", value=True)
     show_full_table = st.checkbox("Also show full candidates table", value=False)
     top_k = st.slider("Top K to display", 3, 25, 5)
@@ -108,6 +108,14 @@ def macd_v(price: pd.Series, volume: pd.Series, fast=12, slow=26, signal=9):
     hist = macd_line - signal_line
     return macd_line, signal_line, hist
 
+def safe_vwap(price: pd.Series, volume: pd.Series, window=20):
+    # NaN-safe rolling VWAP; align shapes before weighting
+    df = pd.DataFrame({"p": price, "v": volume}).dropna()
+    if len(df) < window or df["v"].sum() == 0:
+        return np.nan
+    roll = df.iloc[-window:]
+    return float((roll["p"] * roll["v"]).sum() / roll["v"].sum())
+
 @st.cache_data(show_spinner=False)
 def fetch_one(ticker: str, period_days: int, retries: int, sleep: float):
     last_err = None
@@ -176,6 +184,10 @@ for idx, (t, source) in enumerate(universe_pairs, start=1):
         if data.empty or len(data) < 30:
             continue
 
+        data = data.dropna(subset=["Close","Volume","High","Low"])
+        if data.empty:
+            continue
+
         close = data["Close"]
         vol = data["Volume"].fillna(0)
         high = data["High"]; low = data["Low"]
@@ -213,9 +225,9 @@ for idx, (t, source) in enumerate(universe_pairs, start=1):
         v_last, v_avg = float(vol.iloc[-1]), float(vol_avg20.iloc[-1])
         vol_ok = (v_avg > 0) and (v_last >= vol_mult * v_avg)
 
-        # Breakout confirm: close above yesterday's high and > 20‑day VWAP
+        # Breakout confirm: close above yesterday's high and > 20‑day VWAP (robust)
         prev_high = float(high.iloc[-2]) if len(high) >= 2 else np.nan
-        vwap20 = float((close.rolling(20).apply(lambda s: np.average(s, weights=vol.loc[s.index]), raw=False)).iloc[-1])
+        vwap20 = safe_vwap(close, vol, 20)
         breakout_ok = (np.isfinite(prev_high) and last > prev_high) and (np.isfinite(vwap20) and last > vwap20)
 
         # R/R with stop at EMA50
