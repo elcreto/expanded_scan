@@ -1,23 +1,34 @@
-import time
+
+import time, os, io
 import pandas as pd
 import numpy as np
 import streamlit as st
 import yfinance as yf
 
-APP_NAME = "🚀 Expanded Universe Scanner v1.3.0 — MACD‑V, Score 0–5, Static NDX Fallback"
+APP_NAME = "🚀 Expanded Universe Scanner v1.3.1 — MACD‑V, Score 0–5, Static S&P/Russell Cache"
 st.set_page_config(page_title=APP_NAME, layout="wide")
 st.title(APP_NAME)
-st.caption("Multi‑source universe (wild cards + indices). MACD‑V only. **Score 0–5** (Trend, MACD‑V, Volume, R/R, Breakout). "
-           "NaN‑safe VWAP. Top‑K fallback. Uses **static Nasdaq‑100 list** if Wikipedia fetch fails (fix for 'only 93 tickers').")
+st.caption("Reliable universes with static on-disk caches. First run can auto-fetch; subsequent runs use local CSVs even if the web breaks. "
+           "Scoring 0–5 (Trend, MACD‑V, Volume, R/R, Breakout). NaN‑safe VWAP. Top‑K fallback.")
+
+DATA_DIR = "universes"
+os.makedirs(DATA_DIR, exist_ok=True)
 
 # ---------- Sidebar ----------
 with st.sidebar:
-    st.subheader("Universe Sources")
-    use_curated = st.checkbox("Curated Wild Cards (AI/biotech/semis/IPO)", value=True)
-    use_ndx100  = st.checkbox("Nasdaq‑100", value=True)
-    use_r1000   = st.checkbox("Russell 1000 (experimental)", value=False)
-    use_r2000   = st.checkbox("Russell 2000 (experimental)", value=False)
+    st.subheader("Universe Sources (static caches preferred)")
+    use_curated = st.checkbox("Curated Wild Cards", value=True)
+    use_sp500  = st.checkbox("S&P 500 (cached CSV)", value=True)
+    use_ndx100 = st.checkbox("Nasdaq‑100 (cached CSV)", value=True)
+    use_r1000  = st.checkbox("Russell 1000 (cached CSV)", value=False)
+    use_r2000  = st.checkbox("Russell 2000 (cached CSV)", value=False)
     custom_tickers = st.text_area("Custom tickers (comma‑separated)", "", height=80)
+
+    st.markdown("---")
+    st.subheader("Static Cache Control")
+    st.write("If a CSV exists in /universes, it will be used. You can (re)build caches below.")
+    rebuild = st.button("🔁 Fetch & (Re)build Caches Now")
+
     st.markdown("---")
     st.subheader("Filters")
     vol_mult = st.number_input("Volume multiple (vs 20‑day avg) ≥", min_value=1.0, value=2.0, step=0.1)
@@ -26,73 +37,127 @@ with st.sidebar:
     min_dollar_vol = st.number_input("Min dollar volume 20d ($M/day) ≥", min_value=0.0, value=5.0, step=1.0)
     max_adr = st.number_input("Max ADR(20) % ≤", min_value=2.0, value=22.0, step=1.0)
     min_adr = st.number_input("Min ADR(20) % ≥", min_value=0.5, value=2.0, step=0.5)
+
     st.markdown("---")
     st.subheader("Runtime")
-    max_universe = st.number_input("Max tickers to scan", min_value=100, value=1200, step=100)
+    max_universe = st.number_input("Max tickers to scan", min_value=100, value=2000, step=100)
     days = st.slider("Lookback period (days)", 60, 365, 180)
     retries = st.slider("Max retries per ticker", 0, 5, 2)
-    sleep_s = st.number_input("Sleep between downloads (sec)", min_value=0.0, value=0.12, step=0.02)
-    export_filename = st.text_input("Export base filename", "expanded_universe_v130_score5")
+    sleep_s = st.number_input("Sleep between downloads (sec)", min_value=0.0, value=0.10, step=0.02)
+    export_filename = st.text_input("Export base filename", "expanded_universe_v131_static")
     gate_strict = st.checkbox("Gate to high‑conviction only (Score≥4 AND MACD‑V ✅)", value=True)
     top_k = st.slider("Top K to display", 3, 25, 5)
 
-# ---------- Static Lists (fallbacks) ----------
-NDX100_STATIC = [
-"ADBE","ADI","ADP","ADSK","AEP","ALGN","AMAT","AMD","AMGN","AMZN","ANSS","ASML","AVGO","AZN","BIDU","BKNG","CDNS","CEG",
-"CHTR","CMCSA","COST","CPRT","CRWD","CSCO","CSGP","CSX","CTAS","CTSH","DDOG","DLTR","DOCU","DXCM","EA","EBAY","ENPH",
-"EXC","FAST","FTNT","GEHC","GFS","GILD","GOOG","GOOGL","HON","IDXX","ILMN","INTC","INTU","ISRG","JD","KDP","KHC","KLAC",
-"KDP","LRCX","LULU","MAR","MCHP","MDLZ","MELI","META","MNST","MRVL","MSFT","MU","NFLX","NVDA","NXPI","ODFL","ORLY","PANW",
-"PAYX","PCAR","PDD","PEP","PYPL","QCOM","REGN","RICI","ROST","SBUX","SGEN","SIRI","SNPS","SPLK","TEAM","TMUS","TSLA",
-"TSM","TTD","TXN","VRSK","VRTX","WBA","WDAY","XEL","ZM"
-]
-# de-dup and clean
-NDX100_STATIC = sorted(list({s.replace(".","-").upper() for s in NDX100_STATIC}))
+# ---------- Starter seed lists ----------
+CURATED = sorted(list({
+    "SMCI","PLTR","AMD","ARM","TSM","AEHR","AI","IONQ","UPST","SOUN","CELH","NET","DDOG","PATH","U","AFRM",
+    "RIOT","MARA","RIVN","LCID","ROKU","HOOD","TOST","COIN","CRNX","RXRX","BMRN","CRSP","TWLO","SNOW","MDB",
+    "ZS","OKTA","BILL","ASAN","SHOP","SOFI","GLBE","BMBL","VRT","ENVX","WOLF","ON","RUN","ENPH","FSLR","SEDG",
+    "HIMS","AXON","APP","CFLT","MQ","FSLY","PVH","CPNG","PINS","TTD","BABA","JD","PDD","NIO","XPEV","LI","GTLB",
+    "ELF","CRWD","DOCN","RBLX","DKNG","IOT","INFA","CAVA","SATS","WBD","NBIS"
+}))
 
-CURATED = [
-    "NBIS","SMCI","PLTR","ARM","TSM","AEHR","NVAX","AI","IONQ","UPST","SOUN","CELH","NET","DDOG","PATH","U","AFRM",
-    "RIOT","MARA","RIVN","LCID","ROKU","HOOD","TOST","COIN","CRNX","ABCM","SANA","RXRX","BMRN","CRSP","TWLO","SNOW","MDB",
-    "ZS","OKTA","BILL","ASAN","SHOP","SOFI","BROS","GLBE","BMBL","VRT","ENVX","WOLF","ON","AMBA","RUN","ENPH","FSLR","SEDG",
-    "WIX","HIMS","RXST","KNSL","AXON","ESTC","APP","CFLT","MQ","LC","FSLY","PVH","CPNG","PINS","PARA","TTD","ROIV","BABA",
-    "JD","PDD","NIO","XPEV","LI","ZIM","GTLB","ELF","TPR","CRWD","DOCN","RBLX","DKNG","BNFT","IOT","INFA","CAVA","SATS","WBD"
-]
-CURATED = list(dict.fromkeys(CURATED))
+SP500_STARTER = sorted(list({
+    "AAPL","MSFT","AMZN","META","GOOGL","GOOG","NVDA","BRK-B","JPM","TSLA","UNH","XOM","LLY","V","MA","PG",
+    "HD","COST","AVGO","ADBE","CRM","PEP","KO","MRK","ABBV","TMO","CSCO","WMT","MCD","BAC","NFLX","ACN","ABT","DHR",
+    "LIN","CMCSA","INTC","WFC","TXN","AMD","HON","NEE","PM","UNP","CVX","LOW","ORCL","QCOM","INTU","AMAT","IBM",
+    "CAT","AMGN","GS","GE","RTX","MDT","NOW","LMT","BKNG","BLK","MU","ADI","ISRG","REGN","PYPL","GILD","PFE"
+}))
 
-# ---------- Helpers ----------
-def fetch_table(url, col):
+NDX100_STARTER = sorted(list({
+    "ADBE","ADI","ADP","AMAT","AMD","AMGN","AMZN","ASML","AVGO","CDNS","CMCSA","COST","CPRT","CRWD","CSCO","CSX",
+    "CTAS","DDOG","DXCM","EA","ENPH","FTNT","GFS","GILD","GOOG","GOOGL","HON","IDXX","ILMN","INTC","INTU","ISRG","KLAC",
+    "LRCX","LULU","MAR","MCHP","META","MNST","MRVL","MSFT","MU","NFLX","NVDA","NXPI","ODFL","ORLY","PANW","PEP",
+    "PYPL","QCOM","REGN","ROST","SBUX","SNPS","TMUS","TSLA","TSM","TTD","TXN","VRSK","VRTX","WDAY","XEL","ZM"
+}))
+
+# ---------- Cache I/O ----------
+DATA_DIR = "universes"
+def write_cache(name, symbols):
+    path = os.path.join(DATA_DIR, f"{name}.csv")
+    pd.Series(sorted(set([s.replace('.','-').upper() for s in symbols if isinstance(s,str) and s.strip()]))).to_csv(path, index=False, header=["Symbol"])
+    return path
+
+def read_cache(name):
+    path = os.path.join(DATA_DIR, f"{name}.csv")
+    if os.path.exists(path):
+        s = pd.read_csv(path)["Symbol"].astype(str).tolist()
+        return [x.replace(".","-").upper() for x in s]
+    return []
+
+def _try_read_html(url, col):
     try:
-        tables = pd.read_html(url)
-        for t in tables:
+        tabs = pd.read_html(url)
+        for t in tabs:
             if col in t.columns:
                 return t[col].astype(str).tolist()
     except Exception:
         return []
     return []
 
-@st.cache_data(show_spinner=True)
-def build_universe(use_curated, use_ndx100, use_r1000, use_r2000, custom):
+def build_or_load(name, starter, fetch_urls):
+    cached = read_cache(name)
+    if cached:
+        return cached, True
+    syms = []
+    for (url, col) in fetch_urls:
+        syms = _try_read_html(url, col)
+        if syms:
+            break
+    if not syms:
+        syms = starter
+    write_cache(name, syms)
+    return syms, False
+
+if rebuild:
+    st.info("Rebuilding caches…")
+    sp_syms, _ = build_or_load("sp500", SP500_STARTER, [
+        ("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", "Symbol"),
+        ("https://www.slickcharts.com/sp500", "Symbol"),
+    ])
+    ndx_syms, _ = build_or_load("nasdaq100", NDX100_STARTER, [
+        ("https://en.wikipedia.org/wiki/Nasdaq-100", "Ticker"),
+    ])
+    r1k_syms, _ = build_or_load("russell1000", [], [
+        ("https://en.wikipedia.org/wiki/Russell_1000_Index", "Symbol"),
+        ("https://en.wikipedia.org/wiki/Russell_1000_Index", "Ticker"),
+    ])
+    r2k_syms, _ = build_or_load("russell2000", [], [
+        ("https://en.wikipedia.org/wiki/Russell_2000_Index", "Symbol"),
+        ("https://en.wikipedia.org/wiki/Russell_2000_Index", "Ticker"),
+    ])
+    st.success(f"Caches saved: SP500={len(sp_syms)}, NDX100={len(ndx_syms)}, R1000={len(r1k_syms)}, R2000={len(r2k_syms)}")
+
+def assemble_universe():
     symbols = []
     if use_curated:
         symbols += [(s, "Curated") for s in CURATED]
+    if use_sp500:
+        syms, _ = build_or_load("sp500", SP500_STARTER, [
+            ("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", "Symbol"),
+            ("https://www.slickcharts.com/sp500", "Symbol"),
+        ])
+        symbols += [(s, "SP500") for s in syms]
     if use_ndx100:
-        syms = fetch_table("https://en.wikipedia.org/wiki/Nasdaq-100", "Ticker")
-        if not syms:  # fallback when Wikipedia blocks/changes format
-            st.warning("Nasdaq‑100 web fetch failed — using built‑in static list.", icon="⚠️")
-            syms = NDX100_STATIC
-        symbols += [(s.replace(".", "-").upper(), "NDX100") for s in syms]
+        syms, _ = build_or_load("nasdaq100", NDX100_STARTER, [
+            ("https://en.wikipedia.org/wiki/Nasdaq-100", "Ticker"),
+        ])
+        symbols += [(s, "NDX100") for s in syms]
     if use_r1000:
-        syms = fetch_table("https://en.wikipedia.org/wiki/Russell_1000_Index", "Ticker")
-        if not syms:
-            st.warning("Russell 1000 fetch failed — disable this source or paste custom tickers.", icon="⚠️")
-        symbols += [(s.replace(".", "-").upper(), "R1000") for s in syms]
+        syms, _ = build_or_load("russell1000", [], [
+            ("https://en.wikipedia.org/wiki/Russell_1000_Index", "Symbol"),
+            ("https://en.wikipedia.org/wiki/Russell_1000_Index", "Ticker"),
+        ])
+        symbols += [(s, "R1000") for s in syms]
     if use_r2000:
-        syms = fetch_table("https://en.wikipedia.org/wiki/Russell_2000_Index", "Ticker")
-        if not syms:
-            st.warning("Russell 2000 fetch failed — disable this source or paste custom tickers.", icon="⚠️")
-        symbols += [(s.replace(".", "-").upper(), "R2000") for s in syms]
-    if custom:
-        extra = [x.strip().upper().replace(".", "-") for x in custom.split(",") if x.strip()]
+        syms, _ = build_or_load("russell2000", [], [
+            ("https://en.wikipedia.org/wiki/Russell_2000_Index", "Symbol"),
+            ("https://en.wikipedia.org/wiki/Russell_2000_Index", "Ticker"),
+        ])
+        symbols += [(s, "R2000") for s in syms]
+    if custom_tickers:
+        extra = [x.strip().upper().replace(".", "-") for x in custom_tickers.split(",") if x.strip()]
         symbols += [(s, "Custom") for s in extra]
-    # de‑dupe, keep first source tag
     seen = set(); out = []
     for s, src in symbols:
         if s and s not in seen:
@@ -142,11 +207,11 @@ def macdv_badge(hist_series):
     if last < 0: return "❌ Bearish"
     return "⚠️ Weak/Flat"
 
-# ---------- Scan ----------
-universe_pairs = build_universe(use_curated, use_ndx100, use_r1000, use_r2000, custom_tickers)
+# Scan
+universe_pairs = assemble_universe()
 if len(universe_pairs) > max_universe:
     universe_pairs = universe_pairs[: int(max_universe)]
-st.info(f"Loaded {len(universe_pairs)} tickers from sources. Scanning…")
+st.info(f"Loaded {len(universe_pairs)} tickers from caches/sources. Scanning…")
 
 records, failures = [], []
 progress = st.progress(0)
@@ -206,7 +271,6 @@ for idx, (t, source) in enumerate(universe_pairs, start=1):
         else:
             target, rr, rr_ok = np.nan, np.nan, False
 
-        # -------- Score 0–5 --------
         score = int(trend_ok) + int(macd_ok) + int(vol_ok) + int(rr_ok) + int(breakout_ok)
 
         records.append({
@@ -223,11 +287,10 @@ for idx, (t, source) in enumerate(universe_pairs, start=1):
     except Exception as e:
         failures.append((t, str(e)))
 
-    if idx % 20 == 0 or idx == len(universe_pairs):
+    if idx % 50 == 0 or idx == len(universe_pairs):
         progress.progress(idx / len(universe_pairs))
         status_box.info(f"Scanning {idx}/{len(universe_pairs)}…")
 
-# ---------- Output ----------
 def rank_df(df):
     sort_cols = ["Score (0-5)", "R/R", "DollarVol20d($M)"]
     return df.sort_values(by=sort_cols, ascending=[False, False, False]).reset_index(drop=True)
@@ -239,7 +302,7 @@ if records:
         df_gate = df_gate[(df_gate["Score (0-5)"] >= 4) & (df_gate["MACD‑V"] == "✅ Bullish")]
 
     if len(df_gate) == 0:
-        st.warning("No strict passes. Showing **Top‑K fallback** ranked from all candidates (below strict threshold).")
+        st.warning("No strict passes. Showing Top‑K fallback from all candidates (below strict threshold).")
         df_show = rank_df(df_all).head(top_k)
     else:
         df_show = rank_df(df_gate).head(top_k)
@@ -255,9 +318,9 @@ if records:
                            data=rank_df(df_gate).to_csv(index=False).encode("utf-8"),
                            file_name=f"{export_filename}_ranked.csv", mime="text/csv")
 else:
-    st.error("No usable data fetched from any ticker (sources returned empty). Try toggling sources or loosening filters.")
+    st.error("No usable data fetched from any ticker. Loosen filters or build caches.")
 
 if failures:
-    with st.expander("Fetch errors / skips (for transparency)"):
-        for t, msg in failures[:300]:
+    with st.expander("Fetch errors / skips (up to 400 shown)"):
+        for t, msg in failures[:400]:
             st.write(f"- {t}: {msg}")
