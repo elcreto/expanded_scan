@@ -1,0 +1,12 @@
+# Expanded Universe Scanner v1.3
+
+This scanner builds a broader watchlist using static cached universes (S&P 500, Nasdaq-100, Russell 1000/2000, and curated lists).  
+The logic is identical to the S&P 500 scanner but covers a wider universe.
+
+---
+
+## Run interactively
+
+```bash
+pip install -r requirements.txt
+streamlit run streamlit_app.py
